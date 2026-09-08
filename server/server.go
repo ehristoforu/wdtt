@@ -56,7 +56,7 @@ const (
 	wgServerCIDR            = wgServerAddr + "/24"
 	defaultInternalWGPort   = 56001
 	defaultClientDNS        = "1.1.1.1"
-	defaultMaxUsers         = 10
+	defaultMaxUsers         = 249
 	maxUsersSubnetLimit     = 249
 	defaultWgMTU            = 1280
 	defaultPanelTCPPort     = 2860 // fallback до panel.db
