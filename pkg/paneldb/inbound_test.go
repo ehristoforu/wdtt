@@ -18,7 +18,7 @@ CREATE TABLE wdtt_inbound (
 	client_port INTEGER NOT NULL DEFAULT 9000,
 	dns TEXT NOT NULL DEFAULT '1.1.1.1',
 	mtu INTEGER NOT NULL DEFAULT 1280,
-	max_users INTEGER NOT NULL DEFAULT 10,
+	max_users INTEGER NOT NULL DEFAULT 249,
 	handshake_timeout_sec INTEGER NOT NULL DEFAULT 30,
 	max_dtls_per_device INTEGER NOT NULL DEFAULT 0,
 	online_timeout_sec INTEGER NOT NULL DEFAULT 15,
@@ -68,7 +68,7 @@ func TestLoadRuntimeSettings(t *testing.T) {
 	db := openInboundTestDB(t)
 	defer db.Close()
 
-	if err := SaveInbound(db, &Inbound{DNS: "1.0.0.1", MTU: 1280, MaxUsers: 10, HandshakeTimeoutSec: 30, OnlineTimeoutSec: 15, RawEnable: true}); err != nil {
+	if err := SaveInbound(db, &Inbound{DNS: "1.0.0.1", MTU: 1280, MaxUsers: 249, HandshakeTimeoutSec: 30, OnlineTimeoutSec: 15, RawEnable: true}); err != nil {
 		t.Fatal(err)
 	}
 	rs, ok, err := LoadRuntimeSettings(db)
@@ -86,7 +86,7 @@ func TestLoadStartupSettings(t *testing.T) {
 
 	if err := SaveInbound(db, &Inbound{
 		ListenHost: "0.0.0.0", DtlsPort: 56002, WgPort: 56003, AdminAddr: "127.0.0.1:2862",
-		DNS: "1.0.0.1", MTU: 1280, MaxUsers: 10, HandshakeTimeoutSec: 30, OnlineTimeoutSec: 15,
+		DNS: "1.0.0.1", MTU: 1280, MaxUsers: 249, HandshakeTimeoutSec: 30, OnlineTimeoutSec: 15,
 	}); err != nil {
 		t.Fatal(err)
 	}

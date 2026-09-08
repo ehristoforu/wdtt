@@ -43,7 +43,7 @@ func TestDefaultInboundPortsCSVFromDB(t *testing.T) {
 		client_port INTEGER NOT NULL DEFAULT 9000,
 		dns TEXT NOT NULL DEFAULT '',
 		mtu INTEGER NOT NULL DEFAULT 1280,
-		max_users INTEGER NOT NULL DEFAULT 10,
+		max_users INTEGER NOT NULL DEFAULT 249,
 		handshake_timeout_sec INTEGER NOT NULL DEFAULT 30,
 		max_dtls_per_device INTEGER NOT NULL DEFAULT 0,
 		online_timeout_sec INTEGER NOT NULL DEFAULT 60,
@@ -57,7 +57,7 @@ func TestDefaultInboundPortsCSVFromDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := paneldb.SaveInbound(sqlDB, &paneldb.Inbound{
-		Tag: "wdtt", Enable: true, DtlsPort: 56100, WgPort: 56101, ClientPort: 9100, MTU: 1280, MaxUsers: 10,
+		Tag: "wdtt", Enable: true, DtlsPort: 56100, WgPort: 56101, ClientPort: 9100, MTU: 1280, MaxUsers: 249,
 	}); err != nil {
 		t.Fatal(err)
 	}

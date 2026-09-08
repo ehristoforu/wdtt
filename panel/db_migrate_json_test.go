@@ -51,7 +51,7 @@ func TestMigrateLegacyJSONFiles(t *testing.T) {
   "client_port": 9000,
   "dns": "1.1.1.1",
   "mtu": 1280,
-  "max_users": 10,
+  "max_users": 249,
   "handshake_timeout_sec": 30,
   "max_dtls_per_device": 0,
   "admin_addr": "127.0.0.1:2861"

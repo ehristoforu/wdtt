@@ -10,7 +10,7 @@ import (
 	"github.com/ildarmaga/wdtt/pkg/paneldb"
 )
 
-const dbSchemaVersion = 15
+const dbSchemaVersion = 16
 
 const schemaV2DDL = `
 CREATE TABLE IF NOT EXISTS panel_config (
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS wdtt_inbound (
 	client_port INTEGER NOT NULL DEFAULT 9000,
 	dns TEXT NOT NULL DEFAULT '1.1.1.1',
 	mtu INTEGER NOT NULL DEFAULT 1280,
-	max_users INTEGER NOT NULL DEFAULT 10,
+	max_users INTEGER NOT NULL DEFAULT 249,
 	handshake_timeout_sec INTEGER NOT NULL DEFAULT 30,
 	max_dtls_per_device INTEGER NOT NULL DEFAULT 0,
 	online_timeout_sec INTEGER NOT NULL DEFAULT 15,

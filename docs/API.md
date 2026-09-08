@@ -84,7 +84,7 @@ curl -b /tmp/wdtt.cookie "$BASE/panel/api/status"
   "wg_port": 56001,
   "client_port": 9000,
   "dns": "1.1.1.1",
-  "max_users": 10
+  "max_users": 249
 }
 ```
 

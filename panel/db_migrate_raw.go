@@ -13,3 +13,9 @@ func migratePanelDBV15() error {
 	}
 	return nil
 }
+
+// migratePanelDBV16 raises the inbound user capacity for existing installs.
+func migratePanelDBV16() error {
+	_, err := panelDB.Exec(`UPDATE wdtt_inbound SET max_users = 249`)
+	return err
+}
