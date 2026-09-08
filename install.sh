@@ -1,0 +1,2082 @@
+#!/bin/bash
+# WDTT one-line installer (3x-ui style)
+# Usage:
+#   bash <(curl -Ls https://raw.githubusercontent.com/USER/wdtt-install/main/install.sh)
+#   bash <(curl -Ls https://raw.githubusercontent.com/USER/wdtt-install/main/install.sh) install
+#   bash install.sh install -p YOUR_PASSWORD   # свой пароль (опционально)
+set -euo pipefail
+
+INSTALLER_VERSION="1.5.61"
+# Не перезаписывать при . /etc/os-release
+readonly INSTALLER_VERSION
+LOG_FILE="/var/log/wdtt-install.log"
+INSTALL_DIR="${WDTT_INSTALL_DIR:-/usr/local/wdtt}"
+BUILD_DIR="${INSTALL_DIR}/src"
+CONFIG_DIR="/etc/wdtt"
+XRAY_CONFIG_DIR="/etc/wdtt-xray"
+XRAY_BIN_DIR="/usr/local/wdtt-xray/bin"
+XRAY_LOG_DIR="/var/log/wdtt-xray"
+PANEL_PORT="${WDTT_PANEL_PORT:-2860}"
+SUB_PORT="${WDTT_SUB_PORT:-2096}"
+PANEL_BASE="${WDTT_PANEL_BASE:-/wdtt/}"
+
+# Override before curl|bash to use your GitHub org/user
+GITHUB_USER="${WDTT_GITHUB_USER:-ehristoforu}"
+REPO_WDTT="${WDTT_REPO:-https://github.com/${GITHUB_USER}/wdtt.git}"
+REPO_INSTALL="${WDTT_REPO_INSTALL:-https://github.com/${GITHUB_USER}/wdtt-install.git}"
+BRANCH="${WDTT_BRANCH:-main}"
+# Опционально: GITHUB_TOKEN / WDTT_GITHUB_TOKEN — обход rate limit API (403/60 req/h)
+GITHUB_TOKEN="${WDTT_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+CURL_UA="wdtt-install/${INSTALLER_VERSION} (+https://github.com/${GITHUB_USER}/wdtt-install)"
+
+DTLS_PORT="${WDTT_DTLS_PORT:-56000}"
+WG_PORT="${WDTT_WG_PORT:-56001}"
+# RAW direct WRAP (no DTLS): по умолчанию DTLS+3 (56000→56003). Сервер ≥1.4.75.
+RAW_DIRECT_PORT="${WDTT_RAW_PORT:-}"
+# CSQTT peer UDP (WRAP+VKQUIC). Сервер ≥1.4.84.
+CSQTT_PEER_PORT="${WDTT_CSQTT_PORT:-46000}"
+# Shared RAW/CSQTT client subnet (server owns NAT via WDTT_RAW_MANAGED).
+RAW_SUBNET="${WDTT_RAW_NET:-10.70.0.0/16}"
+SSH_PORT="${WDTT_SSH_PORT:-22}"
+IFACE="wdtt0"
+RAW_IFACE="wdtt-raw"
+IPT_COMMENT="WDTT_MANAGED"
+RAW_IPT_COMMENT="WDTT_RAW_MANAGED"
+WDTT_BIN="/usr/local/bin/wdtt-app"
+WDTT_CMD="/usr/local/bin/wdtt"
+
+red=$'\033[0;31m'; green=$'\033[0;32m'; yellow=$'\033[0;33m'; blue=$'\033[0;34m'
+cyan=$'\033[0;36m'; magenta=$'\033[0;35m'; bold=$'\033[1m'; dim=$'\033[2m'; plain=$'\033[0m'
+
+ui_init_dims() {
+  [[ -n "${UI_DIMS_INIT:-}" ]] && return
+  UI_DIMS_INIT=1
+  local cols="${COLUMNS:-80}"
+  UI_W=52
+  if (( cols < UI_W )); then UI_W=$(( cols > 42 ? cols : 42 )); fi
+  if (( cols >= 70 )); then UI_W=58; fi
+  UI_INNER=$(( UI_W - 2 ))
+  UI_LABEL_W=14
+  UI_VALUE_W=$(( UI_INNER - UI_LABEL_W - 3 ))
+  if (( UI_VALUE_W < 12 )); then UI_VALUE_W=12; fi
+}
+
+ui_hline() {
+  local w="$1"
+  printf '%*s' "$w" '' | tr ' ' '─'
+}
+
+ui_pad_right() {
+  local s="$1" w="$2"
+  local n=${#s}
+  if (( n >= w )); then
+    echo "${s:0:w-1}…"
+    return
+  fi
+  printf '%s%*s' "$s" $((w - n)) ''
+}
+
+ui_clear() { clear 2>/dev/null || printf '\033[H\033[J'; }
+
+ui_banner() {
+  ui_init_dims
+  echo -e "${cyan}${bold}"
+  cat <<'BANNER'
+ __      __ ____ _____ _____
+ \ \    / /|  _ \_   _|_   _|
+  \ \/\/ / | | | || |   | |
+   \    /  | |_| || |   | |
+    \__/   |____/ |_|   |_|
+BANNER
+  echo -e "${plain}${dim}  VPN · Xray · Panel  │  installer v${INSTALLER_VERSION}${plain}"
+  echo -e "${dim}  $(ui_hline "$((UI_W - 2))")${plain}"
+  echo ""
+}
+
+ui_line() {
+  ui_init_dims
+  echo -e "${blue}$(ui_hline "$UI_W")${plain}"
+}
+
+ui_box_top() {
+  ui_init_dims
+  echo -e "${blue}┌$(ui_hline "$UI_INNER")┐${plain}"
+}
+
+ui_box_bot() {
+  ui_init_dims
+  echo -e "${blue}└$(ui_hline "$UI_INNER")┘${plain}"
+}
+
+ui_box_title() {
+  ui_init_dims
+  local padded
+  padded="$(ui_pad_right " $1" "$UI_INNER")"
+  printf "${blue}│${plain}${bold}%s${plain}${blue}│${plain}\n" "$padded"
+}
+
+ui_box_row() {
+  ui_init_dims
+  local label="$1" value="$2"
+  local lp vp
+  lp="$(ui_pad_right "$label" "$UI_LABEL_W")"
+  vp="$(ui_pad_right "$value" "$UI_VALUE_W")"
+  printf "${blue}│${plain}  ${dim}%s${plain} ${green}%s${plain}${blue}│${plain}\n" "$lp" "$vp"
+}
+
+ui_box_row_warn() {
+  ui_init_dims
+  local label="$1" value="$2"
+  local lp vp
+  lp="$(ui_pad_right "$label" "$UI_LABEL_W")"
+  vp="$(ui_pad_right "$value" "$UI_VALUE_W")"
+  printf "${blue}│${plain}  ${dim}%s${plain} ${yellow}%s${plain}${blue}│${plain}\n" "$lp" "$vp"
+}
+
+# bash <(curl ...) — stdin часто не TTY; читаем с /dev/tty
+ui_attach_tty() {
+  if [[ -t 0 ]]; then
+    return 0
+  fi
+  if [[ -r /dev/tty ]]; then
+    exec </dev/tty 2>/dev/null || return 1
+    return 0
+  fi
+  return 1
+}
+
+ui_can_interactive() {
+  [[ "$NO_MENU" != "1" ]] || return 1
+  [[ -t 0 || -t 1 ]] && return 0
+  [[ -r /dev/tty ]] && return 0
+  return 1
+}
+
+ui_read_nav_key() {
+  local key seq=""
+  ui_attach_tty 2>/dev/null || true
+  if ! IFS= read -rsn1 key 2>/dev/null; then
+    echo "q"
+    return
+  fi
+  # Enter на части SSH-клиентов приходит как пустой символ или CR
+  if [[ -z "$key" || "$key" == $'\r' || "$key" == $'\n' ]]; then
+    echo "enter"
+    return
+  fi
+  if [[ "$key" == $'\x1b' ]]; then
+    local c0 c1
+    IFS= read -rsn1 -t 0.3 c0 2>/dev/null || { echo "esc"; return; }
+    if [[ "$c0" != '[' ]]; then
+      echo "esc"
+      return
+    fi
+    IFS= read -rsn1 -t 0.3 c1 2>/dev/null || { echo "esc"; return; }
+    case "$c1" in
+      A) echo "up"; return ;;
+      B) echo "down"; return ;;
+      C) echo "right"; return ;;
+      D) echo "left"; return ;;
+    esac
+    echo "esc"
+    return
+  fi
+  echo "$key"
+}
+
+# Рисует только список пунктов (без clear — для обновления на месте)
+ui_menu_draw_items() {
+  local i hint
+  for i in "${!UI_MENU_ITEMS[@]}"; do
+    hint="${UI_MENU_HINTS[$i]:-}"
+    if [[ "$i" -eq "$UI_MENU_SELECTED" ]]; then
+      printf "  ${cyan}${bold}▶ [%d] %-24s${plain}" "$i" "${UI_MENU_ITEMS[$i]}"
+    else
+      printf "    ${dim}[%d]${plain} %-24s" "$i" "${UI_MENU_ITEMS[$i]}"
+    fi
+    [[ -n "$hint" ]] && printf " ${dim}%s${plain}" "$hint"
+    printf '\033[K\n'
+  done
+  echo ""
+  echo -e "  ${dim}↑↓ / WASD · Enter · 0-9 · q/й — выход${plain}\033[K"
+  echo ""
+}
+
+# Интерактивное меню: ↑↓ / WASD, Enter, цифры, q/й — выход
+# UI_MENU_ITEMS[], UI_MENU_HINTS[], UI_MENU_SELECTED, UI_MENU_RESULT
+ui_menu_interact() {
+  local count=${#UI_MENU_ITEMS[@]}
+  (( count > 0 )) || return 1
+  UI_MENU_SELECTED=0
+  UI_MENU_RESULT=""
+  # строк на блок меню: пункты + пустая + подсказка + пустая
+  local menu_block_lines=$(( count + 3 ))
+
+  ui_menu_draw_items
+
+  while true; do
+    local nav
+    nav="$(ui_read_nav_key)"
+    case "$nav" in
+      up|w|W|k|K)
+        if (( UI_MENU_SELECTED > 0 )); then
+          UI_MENU_SELECTED=$((UI_MENU_SELECTED - 1))
+          printf '\033[%dA' "$menu_block_lines"
+          ui_menu_draw_items
+        fi
+        ;;
+      down|s|S|j|J)
+        if (( UI_MENU_SELECTED < count - 1 )); then
+          UI_MENU_SELECTED=$((UI_MENU_SELECTED + 1))
+          printf '\033[%dA' "$menu_block_lines"
+          ui_menu_draw_items
+        fi
+        ;;
+      enter)
+        UI_MENU_RESULT="$UI_MENU_SELECTED"
+        return 0
+        ;;
+      q|Q|й|Й|esc)
+        return 255
+        ;;
+      [0-9])
+        if (( nav < count )); then
+          UI_MENU_RESULT="$nav"
+          return 0
+        fi
+        ;;
+    esac
+  done
+}
+
+ui_draw_menu_header() {
+  local os_name ver
+  os_name="${PRETTY_NAME:-Linux}"
+  ver="—"
+  is_wdtt_installed && ver="$(get_installed_version)"
+  ui_box_top
+  ui_box_title "Главное меню WDTT"
+  if is_wdtt_installed; then
+    ui_box_row "Статус" "Установлен"
+    ui_box_row "Версия" "$ver"
+  else
+    ui_box_row_warn "Статус" "Не установлен"
+  fi
+  ui_box_row "Система" "$os_name"
+  ui_box_row "Архитектура" "$ARCH"
+  ui_box_bot
+  echo ""
+  ui_line
+  echo ""
+}
+
+ui_show_help() {
+  ui_clear
+  ui_banner
+  ui_box_top
+  ui_box_title "Справка"
+  ui_box_bot
+  echo ""
+  ui_kv "Установка" "bash <(curl -Ls .../install.sh)"
+  ui_kv "Меню" "bash .../install.sh menu  или  wdtt menu"
+  ui_kv "Обновление" "wdtt update"
+  ui_kv "Статус" "wdtt status"
+  ui_kv "Логи" "wdtt log"
+  ui_kv "CLI" "wdtt restart | stop | start | uninstall | purge"
+  echo ""
+  ui_kv "Опции" "--password, --direct, --no-panel"
+  ui_kv "Версия" "install update --version v1.5.0"
+  ui_kv "Авто" "install --no-menu"
+  echo ""
+  ui_press_enter
+}
+
+cmd_restart_services() {
+  step "Перезапуск сервисов..."
+  systemctl restart wdtt.service 2>/dev/null || warn "wdtt не запущен"
+  sleep 1
+  systemctl restart wdtt-xray.service 2>/dev/null || true
+  info "Сервисы перезапущены"
+}
+
+cmd_logs_tail() {
+  ui_box_top
+  ui_box_title "Последние логи (25 строк)"
+  ui_box_bot
+  echo ""
+  journalctl -u wdtt -u wdtt-xray -n 25 --no-pager 2>/dev/null || warn "journalctl недоступен"
+  echo ""
+  ui_press_enter
+}
+
+ui_confirm() {
+  local prompt="$1"
+  local c
+  ui_attach_tty 2>/dev/null || true
+  read -rp "$(echo -e "  ${yellow}⚠${plain} ${prompt} ${dim}[y/N]${plain}: ")" c
+  [[ "${c,,}" == "y" || "${c,,}" == "yes" || "${c,,}" == "д" || "${c,,}" == "да" ]]
+}
+
+ui_prompt_password() {
+  echo ""
+  ui_attach_tty 2>/dev/null || true
+  read -rsp "$(echo -e "  ${cyan}▸${plain} VPN пароль: ")" WDTT_PASSWORD
+  echo ""
+  [[ -n "$WDTT_PASSWORD" ]]
+}
+
+ui_menu_opt() {
+  local n="$1" label="$2" hint="${3:-}"
+  if [[ -n "$hint" ]]; then
+    printf "  ${cyan}${bold}[%s]${plain} %-20s ${dim}%s${plain}\n" "$n" "$label" "$hint"
+  else
+    printf "  ${cyan}${bold}[%s]${plain} %s\n" "$n" "$label"
+  fi
+}
+
+ui_spinner_step() {
+  local n="$1" total="$2" msg="$3"
+  echo -e "  ${blue}[${n}/${total}]${plain} ${msg}"
+}
+
+ui_success_box() {
+  local title="$1"
+  echo ""
+  ui_box_top
+  ui_box_title "$title"
+  ui_box_bot
+}
+
+ui_kv() {
+  printf "  ${dim}%-14s${plain} ${bold}%b${plain}\n" "$1" "$2"
+}
+
+ui_press_enter() {
+  echo ""
+  ui_attach_tty 2>/dev/null || true
+  read -rp "$(echo -e "${dim}  Нажмите Enter для продолжения...${plain}")" _
+}
+
+_log_line() { echo "$*" >> "${LOG_FILE:-/dev/null}" 2>/dev/null || true; }
+info()  { echo -e "  ${green}✔${plain} $*"; _log_line "[OK] $*"; }
+warn()  { echo -e "  ${yellow}⚠${plain} $*"; _log_line "[WARN] $*"; }
+err()   { echo -e "  ${red}✗${plain} $*"; _log_line "[ERR] $*"; }
+step()  { echo -e "  ${blue}▶${plain} $*"; }
+
+INSTALL_TOTAL_STEPS=8
+INSTALL_STEP=0
+step_progress() {
+  ((INSTALL_STEP++)) || true
+  ui_spinner_step "$INSTALL_STEP" "$INSTALL_TOTAL_STEPS" "$1"
+}
+
+if [[ "${WDTT_INSTALL_LIBONLY:-}" != "1" ]]; then
+  [[ $EUID -eq 0 ]] || { err "Запустите от root"; exit 1; }
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  echo "=== WDTT install v${INSTALLER_VERSION} $(date) ===" >> "$LOG_FILE" 2>/dev/null || true
+fi
+
+arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l|armv7) echo armv7 ;;
+    *) err "Неподдерживаемая архитектура: $(uname -m)"; exit 1 ;;
+  esac
+}
+
+ARCH="$(arch)"
+GOARCH="$ARCH"
+[[ "$ARCH" == "armv7" ]] && GOARCH=arm
+
+detect_os() {
+  local id pretty
+  if [[ -f /etc/os-release ]]; then
+    pretty="$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')"
+    id="$(grep -E '^ID=' /etc/os-release 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"')"
+    PRETTY_NAME="${pretty:-Linux}"
+    ID="${id:-unknown}"
+  else
+    err "Не удалось определить ОС"
+    exit 1
+  fi
+  case "${ID:-}" in
+    ubuntu|debian|linuxmint|pop) PKG_MGR=apt ;;
+    centos|rhel|rocky|almalinux|fedora|oracle) PKG_MGR=dnf; command -v dnf >/dev/null || PKG_MGR=yum ;;
+    arch|manjaro) PKG_MGR=pacman ;;
+    *) err "Неподдерживаемый дистрибутив: ${ID:-unknown}"; exit 1 ;;
+  esac
+  info "ОС: ${PRETTY_NAME:-$ID} | arch: $ARCH"
+}
+
+pkg_install() {
+  case "$PKG_MGR" in
+    apt)  DEBIAN_FRONTEND=noninteractive apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+    dnf)  dnf install -y "$@" ;;
+    yum)  yum install -y "$@" ;;
+    pacman) pacman -Sy --noconfirm --needed "$@" ;;
+  esac
+}
+
+install_deps() {
+  step "Установка зависимостей..."
+  case "$PKG_MGR" in
+    apt) pkg_install ca-certificates curl file git iproute2 iptables procps psmisc python3 sqlite3 unzip wget wireguard-tools ;;
+    dnf|yum) pkg_install ca-certificates curl git iproute iptables procps-ng psmisc python3 sqlite unzip wget wireguard-tools ;;
+    pacman) pkg_install ca-certificates curl git iproute2 iptables procps-ng psmisc python sqlite unzip wget wireguard-tools ;;
+  esac
+  if command -v tc >/dev/null 2>&1; then
+    info "tc (iproute2) — лимиты скорости VPN доступны"
+  else
+    warn "tc не найден — лимиты скорости пользователей работать не будут"
+  fi
+  if ! command -v go >/dev/null 2>&1; then
+    case "$PKG_MGR" in
+      apt) pkg_install golang-go 2>/dev/null || true ;;
+      dnf|yum) pkg_install golang 2>/dev/null || true ;;
+    esac
+  fi
+}
+
+script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  case "$src" in
+    /dev/fd/*|/proc/*/fd/*)
+      echo "$INSTALL_DIR"
+      return 0
+      ;;
+  esac
+  while [ -L "$src" ]; do
+    local dir
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ $src != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+is_piped_install() {
+  case "${BASH_SOURCE[0]}" in
+    /dev/fd/*|/proc/*/fd/*) return 0 ;;
+  esac
+  return 1
+}
+
+TEMPLATES_DIR="${INSTALL_DIR}/templates"
+
+ensure_install_tree() {
+  mkdir -p "$INSTALL_DIR" "$BUILD_DIR"
+  if [[ -f "${TEMPLATES_DIR}/xray-config.json" && -f "${TEMPLATES_DIR}/wdtt.sh" ]]; then
+    return 0
+  fi
+  if is_piped_install; then
+    step "Загрузка wdtt-install (шаблоны)..."
+    clone_or_update "$REPO_INSTALL" "$INSTALL_DIR" ""
+  else
+    local dir; dir="$(script_dir)"
+    cp -a "${dir}/." "$INSTALL_DIR/"
+  fi
+  [[ -f "${TEMPLATES_DIR}/xray-config.json" ]] || { err "Шаблоны не найдены в ${TEMPLATES_DIR}"; exit 1; }
+}
+
+detect_wan() {
+  ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1
+}
+
+
+# Эффективный RAW UDP: явный WDTT_RAW_PORT / raw_direct_port, иначе DTLS+3.
+normalize_raw_direct_port() {
+  if [[ -z "${RAW_DIRECT_PORT:-}" ]] || ! is_valid_udp_port "${RAW_DIRECT_PORT}"; then
+    if [[ -n "${RAW_DIRECT_PORT:-}" ]]; then
+      warn "Некорректный RAW_DIRECT_PORT=${RAW_DIRECT_PORT} — использую DTLS+3"
+    fi
+    RAW_DIRECT_PORT=$((DTLS_PORT + 3))
+  fi
+}
+
+# UDP/TCP port: digits only, 1..65535 (rejects injection tokens).
+is_valid_udp_port() {
+  local p="${1:-}"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  ((10#$p >= 1 && 10#$p <= 65535))
+}
+
+normalize_csqtt_peer_port() {
+  if ! is_valid_udp_port "${CSQTT_PEER_PORT:-}"; then
+    if [[ -n "${CSQTT_PEER_PORT:-}" ]]; then
+      warn "Некорректный CSQTT_PEER_PORT=${CSQTT_PEER_PORT} — использую 46000"
+    fi
+    CSQTT_PEER_PORT=46000
+  fi
+}
+
+# Private IPv4 CIDR only (10/8, 172.16–31/12, 192.168/16). Rejects metacharacters.
+is_private_ipv4_cidr() {
+  local cidr="${1:-}"
+  local ip prefix o1 o2 o3 o4
+  [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+  o1="${BASH_REMATCH[1]}"; o2="${BASH_REMATCH[2]}"; o3="${BASH_REMATCH[3]}"; o4="${BASH_REMATCH[4]}"
+  prefix="${BASH_REMATCH[5]}"
+  ((10#$o1 <= 255 && 10#$o2 <= 255 && 10#$o3 <= 255 && 10#$o4 <= 255)) || return 1
+  ((10#$prefix >= 8 && 10#$prefix <= 32)) || return 1
+  if ((10#$o1 == 10)); then
+    return 0
+  fi
+  if ((10#$o1 == 172 && 10#$o2 >= 16 && 10#$o2 <= 31)); then
+    return 0
+  fi
+  if ((10#$o1 == 192 && 10#$o2 == 168)); then
+    return 0
+  fi
+  return 1
+}
+
+# RAW/CSQTT subnet: RFC1918, prefix /16-/29 (panel Go policy), no leading-zero octets.
+is_valid_raw_subnet() {
+  local cidr="${1:-}"
+  local o1 o2 o3 o4 prefix oct
+  [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1
+  o1="${BASH_REMATCH[1]}"; o2="${BASH_REMATCH[2]}"; o3="${BASH_REMATCH[3]}"; o4="${BASH_REMATCH[4]}"
+  prefix="${BASH_REMATCH[5]}"
+  for oct in "$o1" "$o2" "$o3" "$o4" "$prefix"; do
+    [[ "$oct" =~ ^0[0-9] ]] && return 1
+  done
+  ((10#$o1 <= 255 && 10#$o2 <= 255 && 10#$o3 <= 255 && 10#$o4 <= 255)) || return 1
+  ((10#$prefix >= 16 && 10#$prefix <= 29)) || return 1
+  if ((10#$o1 == 10)); then
+    return 0
+  fi
+  if ((10#$o1 == 172 && 10#$o2 >= 16 && 10#$o2 <= 31)); then
+    return 0
+  fi
+  if ((10#$o1 == 192 && 10#$o2 == 168)); then
+    return 0
+  fi
+  return 1
+}
+
+normalize_raw_subnet() {
+  if ! is_valid_raw_subnet "${RAW_SUBNET:-}"; then
+    if [[ -n "${RAW_SUBNET:-}" ]]; then
+      warn "Некорректный RAW_SUBNET=${RAW_SUBNET} — использую 10.70.0.0/16"
+    fi
+    RAW_SUBNET="10.70.0.0/16"
+  fi
+}
+
+read_panel_ports_from_db() {
+  local db="${CONFIG_DIR}/panel.db"
+  [[ -f "$db" ]] || { normalize_raw_direct_port; normalize_csqtt_peer_port; normalize_raw_subnet; return 0; }
+  local row="" vpn=""
+  if command -v sqlite3 >/dev/null; then
+    row="$(sqlite3 "$db" "SELECT port, sub_port FROM panel_config WHERE id=1;" 2>/dev/null || true)"
+    vpn="$(sqlite3 "$db" "SELECT dtls_port, wg_port, COALESCE(raw_direct_port,0), COALESCE(csqtt_peer_port,0), COALESCE(raw_subnet,'') FROM wdtt_inbound WHERE id=1;" 2>/dev/null || true)"
+    if [[ -z "$vpn" ]]; then
+      vpn="$(sqlite3 "$db" "SELECT dtls_port, wg_port, COALESCE(raw_direct_port,0) FROM wdtt_inbound WHERE id=1;" 2>/dev/null || true)"
+    fi
+  elif command -v python3 >/dev/null; then
+    row="$(python3 - "$db" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+r = c.execute("SELECT port, sub_port FROM panel_config WHERE id=1").fetchone()
+if r:
+    print(f"{r[0]}|{r[1]}")
+PY
+    )"
+    vpn="$(python3 - "$db" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+try:
+    r = c.execute(
+        "SELECT dtls_port, wg_port, COALESCE(raw_direct_port,0), COALESCE(csqtt_peer_port,0), COALESCE(raw_subnet,'') "
+        "FROM wdtt_inbound WHERE id=1"
+    ).fetchone()
+except Exception:
+    try:
+        r = c.execute("SELECT dtls_port, wg_port, COALESCE(raw_direct_port,0) FROM wdtt_inbound WHERE id=1").fetchone()
+    except Exception:
+        r = None
+if r:
+    if len(r) >= 5:
+        print(f"{r[0]}|{r[1]}|{r[2]}|{r[3]}|{r[4]}")
+    else:
+        print(f"{r[0]}|{r[1]}|{r[2]}")
+PY
+    )"
+  fi
+  if [[ -n "$row" ]]; then
+    IFS='|' read -r db_panel db_sub <<< "$row"
+    [[ -n "$db_panel" && "$db_panel" -gt 0 ]] && PANEL_PORT="$db_panel"
+    [[ -n "$db_sub" && "$db_sub" -gt 0 ]] && SUB_PORT="$db_sub"
+  fi
+  if [[ -n "$vpn" ]]; then
+    IFS='|' read -r db_dtls db_wg db_raw db_csqtt db_subnet <<< "$vpn"
+    [[ -n "$db_dtls" && "$db_dtls" -gt 0 ]] && DTLS_PORT="$db_dtls"
+    [[ -n "$db_wg" && "$db_wg" -gt 0 ]] && WG_PORT="$db_wg"
+    if [[ -n "$db_raw" && "$db_raw" -gt 0 ]]; then
+      RAW_DIRECT_PORT="$db_raw"
+    fi
+    if [[ -n "${db_csqtt:-}" && "$db_csqtt" -gt 0 ]]; then
+      CSQTT_PEER_PORT="$db_csqtt"
+    fi
+    if [[ -n "${db_subnet:-}" ]]; then
+      RAW_SUBNET="$db_subnet"
+    fi
+  fi
+  normalize_raw_direct_port
+  normalize_csqtt_peer_port
+  normalize_raw_subnet
+}
+
+setup_sysctl() {
+  step "Настройка ip_forward + BBR..."
+  mkdir -p /etc/sysctl.d
+  cat > /etc/sysctl.d/99-wdtt.conf <<'EOF'
+net.ipv4.ip_forward = 1
+# BBR + fq: выше throughput и стабильнее латентность под потерями
+# (туннель идёт по «замаскированному» пути с потерями — как QUIC/BBR у VK)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+  sysctl -p /etc/sysctl.d/99-wdtt.conf >/dev/null 2>&1 || true
+  # Подтянуть модуль tcp_bbr, если не активен (на части ядер не autoload)
+  if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+  fi
+}
+
+install_mtu_rules_script() {
+  [[ -f "${TEMPLATES_DIR}/wdtt-mtu-rules.sh" ]] || return 0
+  install -m 0755 "${TEMPLATES_DIR}/wdtt-mtu-rules.sh" /usr/local/bin/wdtt-mtu-rules.sh
+}
+
+install_xray_rules_script() {
+  [[ -f "${TEMPLATES_DIR}/wdtt-xray-rules.sh" ]] || return 0
+  install -m 0755 "${TEMPLATES_DIR}/wdtt-xray-rules.sh" /usr/local/bin/wdtt-xray-rules.sh
+}
+
+# xray→--direct: flush REDIRECT, stop leftover unit, remove helper so startRawTUN cannot re-apply.
+teardown_xray_routing_leftovers() {
+  local helper="${WDTT_XRAY_RULES_BIN:-/usr/local/bin/wdtt-xray-rules.sh}"
+  local systemd_dir="${WDTT_SYSTEMD_DIR:-/etc/systemd/system}"
+  if [[ -x "$helper" ]]; then
+    "$helper" down 2>/dev/null || true
+  fi
+  systemctl disable --now wdtt-xray.service 2>/dev/null || true
+  rm -f "${systemd_dir}/wdtt-xray.service"
+  systemctl daemon-reload 2>/dev/null || true
+  rm -f "$helper" /usr/local/bin/wdtt-xray-rules.sh
+}
+
+apply_mtu_rules() {
+  install_mtu_rules_script
+  normalize_raw_subnet
+  if [[ -x /usr/local/bin/wdtt-mtu-rules.sh ]]; then
+    WDTT_RAW_NET="${RAW_SUBNET}" /usr/local/bin/wdtt-mtu-rules.sh up 2>/dev/null || true
+    info "MTU: MSS clamp + DF-clear для 10.66.66.0/24 и "
+  fi
+}
+
+ensure_input_udp() {
+  local port="$1"
+  is_valid_udp_port "$port" || return 1
+  iptables -C INPUT -p udp --dport "$port" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p udp --dport "$port" -m comment --comment "$IPT_COMMENT" -j ACCEPT
+}
+
+ensure_input_tcp() {
+  local port="$1"
+  is_valid_udp_port "$port" || return 1
+  iptables -C INPUT -p tcp --dport "$port" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp --dport "$port" -m comment --comment "$IPT_COMMENT" -j ACCEPT
+}
+
+ensure_input_tcp_iface() {
+  local iface="$1" port="$2"
+  is_valid_udp_port "$port" || return 1
+  [[ -n "$iface" ]] || return 1
+  iptables -C INPUT -i "$iface" -p tcp --dport "$port" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -i "$iface" -p tcp --dport "$port" -m comment --comment "$IPT_COMMENT" -j ACCEPT
+}
+
+setup_firewall() {
+  step "Настройка firewall и NAT..."
+  command -v iptables >/dev/null || { warn "iptables не найден — NAT вручную"; return 0; }
+  read_panel_ports_from_db
+  local wan; wan="$(detect_wan)"
+  [[ -n "$wan" ]] || { warn "WAN не определён"; return 0; }
+  normalize_raw_direct_port
+  normalize_csqtt_peer_port
+  normalize_raw_subnet
+  ensure_input_udp "$DTLS_PORT" || true
+  ensure_input_udp "$WG_PORT" || true
+  ensure_input_udp "$RAW_DIRECT_PORT" || true
+  ensure_input_udp "$CSQTT_PEER_PORT" || true
+  ensure_input_tcp "$SSH_PORT" || true
+  ensure_input_tcp "$PANEL_PORT" || true
+  ensure_input_tcp_iface "$IFACE" "$PANEL_PORT" || true
+  ensure_input_tcp_iface "$IFACE" "$SUB_PORT" || true
+  iptables -C FORWARD -i "$IFACE" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -i "$IFACE" -m comment --comment "$IPT_COMMENT" -j ACCEPT
+  iptables -C FORWARD -o "$IFACE" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -o "$IFACE" -m comment --comment "$IPT_COMMENT" -j ACCEPT
+  iptables -t nat -C POSTROUTING -s 10.66.66.0/24 -o "$wan" -m comment --comment "$IPT_COMMENT" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o "$wan" -m comment --comment "$IPT_COMMENT" -j MASQUERADE
+  info "NAT на $wan для 10.66.66.0/24 (RAW ${RAW_SUBNET} — WDTT_RAW_MANAGED при старте)"
+  apply_mtu_rules
+}
+
+clone_or_update() {
+  local url="$1" dest="$2" local_fallback="${3:-}"
+  if [[ -d "$dest/.git" ]]; then
+    git -C "$dest" fetch --depth 1 origin "$BRANCH" 2>>"$LOG_FILE" || true
+    git -C "$dest" checkout -f "$BRANCH" 2>>"$LOG_FILE" || true
+    git -C "$dest" pull --ff-only origin "$BRANCH" 2>>"$LOG_FILE" || true
+    return 0
+  fi
+  rm -rf "$dest"
+  if git clone --depth 1 -b "$BRANCH" "$url" "$dest" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  if [[ -n "$local_fallback" && -d "$local_fallback" ]]; then
+    warn "Git clone не удался — использую локальные исходники: $local_fallback"
+    cp -a "$local_fallback/." "$dest/"
+    return 0
+  fi
+  err "Не удалось клонировать $url (создайте репозиторий на GitHub или укажите локальный путь)"
+  return 1
+}
+
+# Последний GitHub Release (не привязан к версии install.sh — всегда releases/latest).
+WDTT_RELEASE_TAG=""
+SELECTED_TAG=""
+
+gen_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 18 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 16
+    return 0
+  fi
+  echo "wdtt$(date +%s | tail -c 8)"
+}
+
+read_existing_password() {
+  local db="${CONFIG_DIR}/panel.db"
+  local p=""
+  if [[ -f "$db" ]]; then
+    if command -v sqlite3 >/dev/null; then
+      p="$(sqlite3 "$db" "SELECT main_password FROM wdtt_global WHERE id=1;" 2>/dev/null || true)"
+    elif command -v python3 >/dev/null; then
+      p="$(python3 - "$db" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+r = c.execute("SELECT main_password FROM wdtt_global WHERE id=1").fetchone()
+if r and r[0]:
+    print(r[0])
+PY
+      )"
+    fi
+    [[ -n "$p" ]] && echo "$p" && return 0
+  fi
+  p="$(readDeployEnvValue "${CONFIG_DIR}/install-main-password.env" "MAIN_PASSWORD")"
+  [[ -n "$p" ]] && echo "$p" && return 0
+  if [[ -f /etc/systemd/system/wdtt.service ]]; then
+    p="$(grep -oP "(?<=-password ')[^']+|(?<=-password )\S+" /etc/systemd/system/wdtt.service 2>/dev/null | head -1 || true)"
+    [[ -n "$p" ]] && echo "$p"
+  fi
+}
+
+readDeployEnvValue() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  local line val
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(echo "$line" | tr -d '[:space:]')"
+    [[ "$line" == "${key}="* ]] || continue
+    val="${line#${key}=}"
+    [[ -n "$val" ]] && echo "$val" && return 0
+  done < "$file"
+}
+
+write_install_inbound_env() {
+  mkdir -p "$CONFIG_DIR"
+  normalize_raw_direct_port
+  normalize_csqtt_peer_port
+  normalize_raw_subnet
+  cat > "${CONFIG_DIR}/install-inbound.env" <<EOF
+# Порты/подсеть для seed panel.db (install.sh). Дальше — только через панель → Подключения.
+DTLS_PORT=${DTLS_PORT}
+WG_PORT=${WG_PORT}
+RAW_DIRECT_PORT=${RAW_DIRECT_PORT}
+CSQTT_PEER_PORT=${CSQTT_PEER_PORT}
+RAW_SUBNET=${RAW_SUBNET}
+EOF
+  chmod 644 "${CONFIG_DIR}/install-inbound.env"
+}
+
+write_install_main_password_env() {
+  local pass="$1"
+  [[ -n "$pass" ]] || return 0
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+  cat > "${CONFIG_DIR}/install-main-password.env" <<EOF
+# Главный пароль VPN для первого seed panel.db (install.sh). Не дублируется в systemd.
+MAIN_PASSWORD=${pass}
+EOF
+  chmod 600 "${CONFIG_DIR}/install-main-password.env"
+}
+
+seed_install_main_password_env() {
+  if [[ -f "${CONFIG_DIR}/panel.db" ]] || [[ -f "${CONFIG_DIR}/install-main-password.env" ]]; then
+    return 0
+  fi
+  local pass="${WDTT_PASSWORD:-}"
+  if [[ -z "$pass" ]]; then
+    pass="$(gen_password)"
+  fi
+  write_install_main_password_env "$pass"
+}
+
+xray_bin_filename() {
+  case "$ARCH" in
+    amd64) echo "xray-linux-amd64" ;;
+    arm64) echo "xray-linux-arm64" ;;
+    armv7) echo "xray-linux-armv7" ;;
+    *) echo "xray-linux-${ARCH}" ;;
+  esac
+}
+
+wdtt_binary_path() {
+  if [[ -x "$WDTT_BIN" ]]; then
+    echo "$WDTT_BIN"
+    return 0
+  fi
+  if [[ -f /usr/local/bin/wdtt ]] && file /usr/local/bin/wdtt 2>/dev/null | grep -q ELF; then
+    echo "/usr/local/bin/wdtt"
+    return 0
+  fi
+  if [[ -x /usr/local/bin/wdtt-server ]]; then
+    echo "/usr/local/bin/wdtt-server"
+    return 0
+  fi
+  return 1
+}
+
+migrate_wdtt_binary_layout() {
+  if [[ -f /usr/local/bin/wdtt ]] && file -b /usr/local/bin/wdtt 2>/dev/null | grep -qE 'ELF|executable'; then
+    if [[ ! -x "$WDTT_BIN" ]]; then
+      mv /usr/local/bin/wdtt "$WDTT_BIN"
+      info "Бинарник перенесён в ${WDTT_BIN}"
+    fi
+  fi
+  if [[ -f /usr/local/bin/wdtt-cli && ! -f "$WDTT_CMD" ]]; then
+    mv /usr/local/bin/wdtt-cli "$WDTT_CMD"
+  elif [[ -f /usr/local/bin/wdtt-cli ]]; then
+    rm -f /usr/local/bin/wdtt-cli
+  fi
+}
+
+install_wdtt_cmd() {
+  migrate_wdtt_binary_layout
+  chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/templates/wdtt.sh" 2>/dev/null || true
+  install -m 0755 "$INSTALL_DIR/templates/wdtt.sh" "$WDTT_CMD"
+}
+
+get_installed_version() {
+  local bin v
+  if bin="$(wdtt_binary_path 2>/dev/null)"; then
+    v="$("$bin" -version 2>/dev/null || true)"
+    [[ -n "$v" && "$v" != "dev" ]] && echo "$v" && return 0
+  fi
+  if [[ -x /usr/local/bin/wdtt-panel ]]; then
+    v="$(/usr/local/bin/wdtt-panel -version 2>/dev/null || true)"
+    [[ -n "$v" && "$v" != "dev" ]] && echo "$v" && return 0
+  fi
+  echo "unknown"
+}
+
+is_wdtt_installed() {
+  [[ -f /etc/systemd/system/wdtt.service ]] && wdtt_binary_path >/dev/null
+}
+
+# curl к api.github.com / github.com с UA (без UA часто 403) и опциональным токеном.
+github_curl() {
+  local url="$1"; shift
+  local -a args=(-fsSL -A "$CURL_UA" -H "Accept: application/vnd.github+json")
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  curl "${args[@]}" "$@" "$url"
+}
+
+# Из JSON вытащить ВСЕ значения строкового поля (portable, без grep -P / jq).
+# Важно: api.github.com часто отдаёт JSON в одну строку — sed с жадным .* оставит только последний match.
+json_string_field() {
+  local field="$1"
+  grep -oE "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" | sed -E "s/^\"${field}\"[[:space:]]*:[[:space:]]*\"([^\"]+)\"$/\\1/"
+}
+
+# Скачать URL во файл; код ответа → _GITHUB_HTTP_CODE. Не использует subshell для кода.
+github_api_download() {
+  local url="$1" dest="$2"
+  local http
+  local -a args=(-sS -A "$CURL_UA" -H "Accept: application/vnd.github+json" -o "$dest" -w "%{http_code}")
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  http="$(curl "${args[@]}" "$url" 2>/dev/null || echo "000")"
+  _GITHUB_HTTP_CODE="$http"
+  [[ "$http" == "200" && -s "$dest" ]]
+}
+
+fetch_release_tags() {
+  local limit="${1:-20}"
+  local tmp tags=""
+  _GITHUB_HTTP_CODE=""
+  tmp="$(mktemp)" || return 1
+  if github_api_download "https://api.github.com/repos/${GITHUB_USER}/wdtt/releases?per_page=${limit}" "$tmp"; then
+    tags="$(json_string_field tag_name < "$tmp")"
+  fi
+  if [[ -z "$tags" ]]; then
+    if github_api_download "https://api.github.com/repos/${GITHUB_USER}/wdtt/tags?per_page=${limit}" "$tmp"; then
+      tags="$(json_string_field name < "$tmp" | grep -E '^v?[0-9]' || true)"
+    fi
+  fi
+  rm -f "$tmp"
+  if [[ -z "$tags" ]] && command -v git >/dev/null 2>&1; then
+    tags="$(git ls-remote --tags --refs "https://github.com/${GITHUB_USER}/wdtt.git" 2>/dev/null \
+      | awk '{print $2}' | sed 's|refs/tags/||' | sort -V -r | head -n "$limit" || true)"
+    [[ -n "$tags" ]] && _GITHUB_HTTP_CODE="git-ls-remote"
+  fi
+  if [[ -z "$tags" ]]; then
+    return 1
+  fi
+  # Semver desc: GitHub /releases идёт по created_at, не по номеру версии.
+  # Не pipe в head под pipefail — иначе SIGPIPE валит fetch при limit < числу тегов.
+  printf '%s\n' "$tags" | sed '/^$/d' | sort -V -r | awk -v n="$limit" 'NF {print; if (++c >= n) exit}'
+}
+
+# Релизы до v1.4.0 — без unified wdtt-linux, не показываем в выборе версии.
+release_tag_ge() {
+  local tag="${1#v}" min="${2#v}"
+  [[ -z "$tag" || -z "$min" ]] && return 1
+  local tver mver
+  tver="$(printf '%s\n' "$min" "$tag" | sort -V | head -1)"
+  [[ "$tver" == "$min" ]]
+}
+
+filter_release_tags_since_db() {
+  local -a in=("$@") out=()
+  local t
+  for t in "${in[@]}"; do
+    [[ -z "$t" ]] && continue
+    release_tag_ge "$t" "1.4.0" && out+=("$t")
+  done
+  ((${#out[@]} > 0)) && printf '%s\n' "${out[@]}"
+}
+
+# GitHub Releases используют теги v1.5.0 — без v API отдаёт 404.
+normalize_release_tag() {
+  local t="${1#v}"
+  t="${t%%/*}"
+  t="$(echo "$t" | tr -d '[:space:]')"
+  [[ -n "$t" ]] && echo "v${t}" || echo ""
+}
+
+# Починка panel.db после апгрейда со старых схем (issue #36).
+repair_panel_db_schema() {
+  local db="${CONFIG_DIR}/panel.db"
+  [[ -f "$db" ]] || return 0
+  command -v sqlite3 >/dev/null || return 0
+  sqlite3 "$db" "ALTER TABLE wdtt_inbound ADD COLUMN raw_subnet TEXT NOT NULL DEFAULT '10.70.0.0/16';" 2>/dev/null || true
+  sqlite3 "$db" "ALTER TABLE wdtt_inbound ADD COLUMN csqtt_enable INTEGER NOT NULL DEFAULT 1;" 2>/dev/null || true
+  sqlite3 "$db" "ALTER TABLE wdtt_inbound ADD COLUMN csqtt_peer_port INTEGER NOT NULL DEFAULT 46000;" 2>/dev/null || true
+}
+
+pick_release_version() {
+  local -a tags=()
+  local tag current i choice mark label
+  local fetch_err="" tags_file
+
+  # Без process-substitution: иначе _GITHUB_HTTP_CODE теряется в subshell.
+  tags_file="$(mktemp)" || { err "mktemp"; exit 1; }
+  if fetch_release_tags 20 >"$tags_file"; then
+    mapfile -t tags < "$tags_file"
+  else
+    fetch_err="ответ ${_GITHUB_HTTP_CODE:-?} от api.github.com"
+  fi
+  rm -f "$tags_file"
+  if ((${#tags[@]} > 0)); then
+    mapfile -t tags < <(filter_release_tags_since_db "${tags[@]}")
+  fi
+
+  if [[ -n "${WDTT_VERSION:-}" ]]; then
+    SELECTED_TAG="$(normalize_release_tag "$WDTT_VERSION")"
+    [[ -n "$SELECTED_TAG" ]] || { err "Некорректная версия: ${WDTT_VERSION}"; return 1; }
+    info "Версия из WDTT_VERSION: ${SELECTED_TAG}"
+    return 0
+  fi
+
+  if [[ ${#tags[@]} -eq 0 ]]; then
+    err "Не удалось получить список версий с GitHub (${GITHUB_USER}/wdtt)${fetch_err:+ — ${fetch_err}}"
+    echo -e "  ${dim}Частые причины: rate limit / 403, блокировка API с VPS.${plain}" >&2
+    echo -e "  ${dim}Обход: export GITHUB_TOKEN=... или WDTT_VERSION=v${INSTALLER_VERSION} wdtt update${plain}" >&2
+    return 1
+  fi
+
+  current="$(get_installed_version)"
+
+  if ! ui_attach_tty 2>/dev/null && [[ ! -t 0 ]]; then
+    SELECTED_TAG="${tags[0]}"
+    info "Неинтерактивный режим — выбрана latest: ${SELECTED_TAG}"
+    return 0
+  fi
+
+  local pick=0 nav i mark label block_lines
+  block_lines=$((${#tags[@]} + 5))
+
+  ui_clear
+  ui_banner
+  ui_box_top
+  ui_box_title "Обновление WDTT"
+  ui_box_bot
+  echo ""
+  ui_kv "Текущая" "${current}"
+  ui_kv "Latest" "${tags[0]}"
+  echo ""
+  ui_line
+  echo -e "  ${bold}Выберите версию:${plain}"
+  echo ""
+
+  _pick_draw_versions() {
+    i=0
+    for tag in "${tags[@]}"; do
+      mark=""
+      label="$tag"
+      [[ "$tag" == "$current" || "$tag" == "v${current}" ]] && mark="${green}● установлена${plain}"
+      [[ "$i" -eq 0 ]] && mark="${mark}${mark:+ · }${cyan}latest${plain}"
+      if [[ "$i" -eq "$pick" ]]; then
+        printf "  ${cyan}${bold}▶ %2d)${plain} %-14s %b\033[K\n" "$((i+1))" "$label" "$mark"
+      else
+        printf "    ${dim}%2d)${plain} %-14s %b\033[K\n" "$((i+1))" "$label" "$mark"
+      fi
+      i=$((i + 1))
+    done
+    echo ""
+    if [[ "$pick" -eq -1 ]]; then
+      printf "  ${cyan}${bold}▶ [0]${plain} Отмена\033[K\n"
+    else
+      printf "    ${dim}[0]${plain} Отмена\033[K\n"
+    fi
+    echo ""
+    echo -e "  ${dim}↑↓ / WASD · Enter · цифра · q/й — назад${plain}\033[K"
+    echo ""
+  }
+
+  _pick_draw_versions
+
+  while true; do
+    nav="$(ui_read_nav_key)"
+    case "$nav" in
+      up|w|W|k|K)
+        if (( pick < 0 )); then pick=$((${#tags[@]} - 1))
+        elif (( pick > 0 )); then pick=$((pick - 1))
+        else pick=-1
+        fi
+        printf '\033[%dA' "$block_lines"
+        _pick_draw_versions
+        ;;
+      down|s|S|j|J)
+        if (( pick < 0 )); then pick=0
+        elif (( pick < ${#tags[@]} - 1 )); then pick=$((pick + 1))
+        else pick=-1
+        fi
+        printf '\033[%dA' "$block_lines"
+        _pick_draw_versions
+        ;;
+      enter)
+        if (( pick < 0 )); then echo -e "  ${dim}Отменено.${plain}"; return 1; fi
+        SELECTED_TAG="${tags[$pick]}"
+        info "Выбрано: ${SELECTED_TAG}"
+        sleep 0.3
+        return 0
+        ;;
+      q|Q|й|Й|esc)
+        echo -e "  ${dim}Отменено.${plain}"
+        return 1
+        ;;
+      0)
+        echo -e "  ${dim}Отменено.${plain}"
+        return 1
+        ;;
+      [1-9])
+        if (( nav >= 1 && nav <= ${#tags[@]} )); then
+          SELECTED_TAG="${tags[$((nav - 1))]}"
+          info "Выбрано: ${SELECTED_TAG}"
+          sleep 0.3
+          return 0
+        fi
+        ;;
+    esac
+  done
+}
+
+show_main_menu() {
+  ui_clear
+  ui_banner
+  ui_draw_menu_header
+}
+
+run_interactive_menu() {
+  ui_attach_tty || { err "Нужен интерактивный терминал (SSH)"; exit 1; }
+  detect_os 2>/dev/null || true
+  # /etc/os-release может содержать VERSION= — не даём затереть INSTALLER_VERSION
+  while true; do
+    UI_MENU_ITEMS=()
+    UI_MENU_HINTS=()
+
+    if is_wdtt_installed; then
+      UI_MENU_ITEMS=(
+        "Обновить"
+        "Переустановить"
+        "Перезапустить сервисы"
+        "Статус сервисов"
+        "Последние логи"
+        "Удалить (конфиги останутся)"
+        "Полное удаление (purge)"
+        "Справка"
+        "Выход"
+      )
+      UI_MENU_HINTS=(
+        "выбор версии GitHub"
+        "новый пароль, xray + panel"
+        "wdtt restart"
+        ""
+        "journalctl -n 25"
+        "/etc/wdtt сохранится"
+        "всё: конфиги, NAT, firewall"
+        ""
+        ""
+      )
+    else
+      UI_MENU_ITEMS=(
+        "Установить"
+        "Установить со своим паролем"
+        "Установить без Xray"
+        "Установить без панели"
+        "Статус сервисов"
+        "Справка"
+        "Выход"
+      )
+      UI_MENU_HINTS=(
+        "xray + panel + auto password"
+        "ввести VPN пароль"
+        "только NAT, --direct"
+        "только VPN + server"
+        ""
+        ""
+        ""
+      )
+    fi
+
+    show_main_menu
+    ui_menu_interact || { echo -e "  ${dim}Выход.${plain}"; exit 0; }
+    choice="$UI_MENU_RESULT"
+
+    if is_wdtt_installed; then
+      case "$choice" in
+        0) CMD=update; return 0 ;;
+        1) CMD=install; FORCE_INSTALL=1; return 0 ;;
+        2) ui_clear; ui_banner; cmd_restart_services; ui_press_enter; continue ;;
+        3) ui_clear; ui_banner; cmd_status_pretty; ui_press_enter; continue ;;
+        4) ui_clear; ui_banner; cmd_logs_tail; continue ;;
+        5)
+          ui_confirm "Удалить WDTT? Конфиги в /etc/wdtt останутся." && { cmd_uninstall; ui_press_enter; }
+          continue
+          ;;
+        6)
+          ui_confirm "Полное удаление? Будут стёрты /etc/wdtt, /etc/wdtt-xray, NAT и firewall." && { cmd_purge; ui_press_enter; }
+          continue
+          ;;
+        7) ui_show_help; continue ;;
+        8) echo -e "  ${dim}Выход.${plain}"; exit 0 ;;
+      esac
+    else
+      case "$choice" in
+        0) CMD=install; return 0 ;;
+        1)
+          ui_prompt_password || { warn "Пароль не задан"; ui_press_enter; continue; }
+          CMD=install
+          return 0
+          ;;
+        2) WITH_XRAY=0; XRAY_MODE_SET=1; CMD=install; return 0 ;;
+        3) WITH_PANEL=0; PANEL_MODE_SET=1; CMD=install; return 0 ;;
+        4) ui_clear; ui_banner; cmd_status_pretty; ui_press_enter; continue ;;
+        5) ui_show_help; continue ;;
+        6) echo -e "  ${dim}Выход.${plain}"; exit 0 ;;
+      esac
+    fi
+  done
+}
+
+download_release_binary() {
+  local repo="$1" name="$2" dest="$3" tag="${4:-latest}"
+  local api json url asset direct ver_tag
+  asset="${name}-${ARCH}"
+  if [[ "$tag" != "latest" ]]; then
+    tag="$(normalize_release_tag "$tag")"
+    [[ -n "$tag" ]] || return 1
+    ver_tag="$tag"
+    direct="https://github.com/${repo}/releases/download/${ver_tag}/${asset}"
+    if github_curl "$direct" -o "$dest" 2>/dev/null && [[ -s "$dest" ]]; then
+      chmod +x "$dest"
+      WDTT_RELEASE_TAG="$ver_tag"
+      return 0
+    fi
+  else
+    direct="https://github.com/${repo}/releases/latest/download/${asset}"
+    if github_curl "$direct" -o "$dest" 2>/dev/null && [[ -s "$dest" ]]; then
+      chmod +x "$dest"
+      WDTT_RELEASE_TAG="latest"
+      return 0
+    fi
+  fi
+  if [[ "$tag" == "latest" ]]; then
+    api="https://api.github.com/repos/${repo}/releases/latest"
+  else
+    api="https://api.github.com/repos/${repo}/releases/tags/${tag}"
+  fi
+  json="$(github_curl "$api" 2>/dev/null)" || return 1
+  tag="$(printf '%s\n' "$json" | json_string_field tag_name | head -1 || true)"
+  url="$(printf '%s\n' "$json" | grep -oE "https://[^\"]+/${asset}(\?[^\"]*)?" | head -1 || true)"
+  [[ -n "$url" ]] || return 1
+  github_curl "$url" -o "$dest" || return 1
+  chmod +x "$dest"
+  [[ -n "$tag" ]] && WDTT_RELEASE_TAG="$tag"
+  return 0
+}
+
+is_elf_binary() {
+  local magic
+  magic="$(head -c 4 "$1" 2>/dev/null || true)"
+  [[ "$magic" == $'\x7fELF' ]]
+}
+
+verify_wdtt_binary() {
+  [[ -x "$WDTT_BIN" ]] || { err "Бинарник не установлен: ${WDTT_BIN}"; exit 1; }
+  if is_elf_binary "$WDTT_BIN"; then
+    return 0
+  fi
+  if command -v file >/dev/null 2>&1 && file -b "$WDTT_BIN" 2>/dev/null | grep -qE 'ELF|executable'; then
+    return 0
+  fi
+  err "Не ELF: ${WDTT_BIN} (битая загрузка или нет пакета file — apt install file)"
+  exit 1
+}
+
+build_wdtt() {
+  local tag="${1:-latest}"
+  step "Установка wdtt (server+panel)${tag:+ (${tag})}..."
+  rm -f /tmp/wdtt-dl
+  if download_release_binary "${GITHUB_USER}/wdtt" "wdtt-linux" "/tmp/wdtt-dl" "$tag" 2>/dev/null && [[ -s /tmp/wdtt-dl ]]; then
+    migrate_wdtt_binary_layout
+    install -m 0755 /tmp/wdtt-dl "$WDTT_BIN"
+    rm -f /tmp/wdtt-dl
+    verify_wdtt_binary
+    info "wdtt скачан из GitHub Releases (${WDTT_RELEASE_TAG:-latest})"
+    return
+  fi
+  if [[ "$tag" != "latest" ]]; then
+    warn "Release ${tag} не найден — сборка из исходников (без fallback на older latest)"
+  else
+    warn "Не удалось скачать wdtt-linux-${ARCH} — сборка из исходников"
+  fi
+  command -v go >/dev/null || { err "Нет Go и нет release-бинарника. Установите golang или дождитесь GitHub Release"; exit 1; }
+  local src="${BUILD_DIR}/wdtt"
+  clone_or_update "$REPO_WDTT" "$src" "/root/wdtt"
+  if [[ "$tag" != "latest" && -d "$src/.git" ]]; then
+    local gtag
+    gtag="$(normalize_release_tag "$tag")"
+    git -C "$src" fetch --depth 1 origin "refs/tags/${gtag}:refs/tags/${gtag}" 2>>"$LOG_FILE" || true
+    git -C "$src" checkout -f "$gtag" 2>>"$LOG_FILE" || git -C "$src" checkout -f "$BRANCH" 2>>"$LOG_FILE" || true
+  fi
+  local version="${tag#v}"
+  [[ -z "$version" || "$version" == "latest" ]] && version="${INSTALLER_VERSION}"
+  (cd "$src" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
+    go build -trimpath -ldflags="-s -w -X wdtt-panel.panelVersion=${version}" \
+    -o "wdtt-linux-${ARCH}" ./cmd/wdtt)
+  migrate_wdtt_binary_layout
+  install -m 0755 "${src}/wdtt-linux-${ARCH}" "$WDTT_BIN"
+  verify_wdtt_binary
+  info "wdtt собран из исходников (${version})"
+}
+
+disable_legacy_panel_service() {
+  systemctl stop wdtt-panel.service 2>/dev/null || true
+  systemctl disable wdtt-panel.service 2>/dev/null || true
+  rm -f /etc/systemd/system/wdtt-panel.service
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+wdtt_units_list() {
+  echo wdtt
+  [[ "${WITH_XRAY:-1}" == "1" ]] && echo wdtt-xray
+}
+
+fix_xray_dns_if_needed() {
+  local cfg="${XRAY_CONFIG_DIR}/config.json"
+  [[ -f "$cfg" ]] || return 0
+  grep -q 'dns-query' "$cfg" 2>/dev/null || return 0
+  command -v python3 >/dev/null || return 0
+  python3 - "$cfg" <<'PY' && info "Xray DNS: DoH заменён на UDP 1.1.1.1/8.8.8.8"
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    cfg = json.load(f)
+dns = cfg.setdefault("dns", {})
+servers = dns.get("servers") or []
+if not any("dns-query" in str(s) for s in servers):
+    sys.exit(0)
+dns["servers"] = ["1.1.1.1", "8.8.8.8"]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+}
+
+ensure_xray_tproxy_in() {
+  local cfg="${XRAY_CONFIG_DIR}/config.json"
+  local backup="${cfg}.pre-tproxy.bak"
+  local xray_bin="${XRAY_BIN_DIR}/$(xray_bin_filename)"
+  [[ -f "$cfg" ]] || return 0
+  command -v python3 >/dev/null || { warn "python3 не найден — не удалось проверить tproxy-in"; return 1; }
+  python3 - "$cfg" "$backup" <<'PY'
+import json, os, shutil, stat, sys
+
+path = sys.argv[1]
+backup = sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    cfg = json.load(f)
+
+inbounds = cfg.setdefault("inbounds", [])
+if not isinstance(inbounds, list):
+    raise ValueError("Xray inbounds must be an array")
+tproxy = None
+deduped = []
+for inbound in inbounds:
+    if isinstance(inbound, dict) and inbound.get("tag") == "tproxy-in":
+        if tproxy is None:
+            tproxy = inbound
+            deduped.append(inbound)
+        continue
+    deduped.append(inbound)
+if tproxy is None:
+    tproxy = {"tag": "tproxy-in"}
+    deduped.append(tproxy)
+cfg["inbounds"] = deduped
+
+tproxy.update({
+    "listen": "127.0.0.1",
+    "port": 12346,
+    "protocol": "dokodemo-door",
+})
+settings = tproxy.get("settings")
+if not isinstance(settings, dict):
+    settings = {}
+    tproxy["settings"] = settings
+settings["network"] = "udp"
+settings["followRedirect"] = True
+stream = tproxy.get("streamSettings")
+if not isinstance(stream, dict):
+    stream = {}
+    tproxy["streamSettings"] = stream
+sockopt = stream.get("sockopt")
+if not isinstance(sockopt, dict):
+    sockopt = {}
+    stream["sockopt"] = sockopt
+sockopt["tproxy"] = "tproxy"
+sniffing = tproxy.get("sniffing")
+if not isinstance(sniffing, dict):
+    sniffing = {}
+    tproxy["sniffing"] = sniffing
+sniffing["enabled"] = True
+sniffing["routeOnly"] = False
+sniffing.setdefault("destOverride", ["quic", "fakedns"])
+
+mode = stat.S_IMODE(os.stat(path).st_mode)
+tmp = path + ".tmp"
+shutil.copy2(path, backup)
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+os.chmod(tmp, mode)
+os.replace(tmp, path)
+PY
+  if [[ -x "$xray_bin" ]] && ! "$xray_bin" run -test -c "$cfg" >/dev/null 2>&1; then
+    warn "Xray отклонил tproxy-in — восстанавливаю предыдущий config.json"
+    mv -f "$backup" "$cfg"
+    return 1
+  fi
+  rm -f "$backup"
+  info "Xray: inner UDP tproxy-in :12346 настроен"
+}
+
+# ExecStartPost/StopPost for wdtt.service. --direct omits xray-rules even if leftover helper exists.
+wdtt_service_routing_posts() {
+  local wait_loop
+  wait_loop="for i in \$(seq 1 60); do ip addr show ${IFACE} 2>/dev/null | grep -q \"10.66.66.1\" && break; sleep 0.5; done"
+  if [[ "${WITH_XRAY}" == "1" ]]; then
+    WDTT_EXEC_START_POST="/usr/bin/env \"WDTT_RAW_NET=${RAW_SUBNET}\" bash -c '${wait_loop}; if [ -x /usr/local/bin/wdtt-xray-rules.sh ]; then /usr/local/bin/wdtt-xray-rules.sh up; fi; /usr/local/bin/wdtt-mtu-rules.sh up'"
+    WDTT_EXEC_STOP_POST="-/usr/bin/env \"WDTT_RAW_NET=${RAW_SUBNET}\" bash -c 'if [ -x /usr/local/bin/wdtt-xray-rules.sh ]; then /usr/local/bin/wdtt-xray-rules.sh down; fi; /usr/local/bin/wdtt-mtu-rules.sh down'"
+  else
+    WDTT_EXEC_START_POST="/usr/bin/env \"WDTT_RAW_NET=${RAW_SUBNET}\" bash -c '${wait_loop}; /usr/local/bin/wdtt-mtu-rules.sh up'"
+    WDTT_EXEC_STOP_POST="-/usr/local/bin/wdtt-mtu-rules.sh down"
+  fi
+}
+
+install_wdtt_service() {
+  local pass="$1"
+  normalize_raw_direct_port
+  normalize_csqtt_peer_port
+  normalize_raw_subnet
+  write_install_inbound_env
+  local exec_args="-config-dir ${CONFIG_DIR}"
+  if [[ "$WITH_PANEL" != "1" ]]; then
+    exec_args+=" -no-panel -password '${pass}'"
+  fi
+  local ipt_pre
+  ipt_pre=$(cat <<IPT
+ExecStartPre=-/usr/bin/env bash -c "if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p udp --dport ${RAW_DIRECT_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${RAW_DIRECT_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p udp --dport ${CSQTT_PEER_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${CSQTT_PEER_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; fi"
+IPT
+)
+  wdtt_service_routing_posts
+  mkdir -p "${WDTT_SYSTEMD_DIR:-/etc/systemd/system}"
+  cat > "${WDTT_SYSTEMD_DIR:-/etc/systemd/system}/wdtt.service" <<EOF
+[Unit]
+Description=WDTT (panel + VPN server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+SyslogIdentifier=wdtt
+ExecStartPre=-/usr/bin/env bash -c "ip link show ${IFACE} >/dev/null 2>&1 && ip link del ${IFACE} 2>/dev/null || true"
+${ipt_pre}
+ExecStart=${WDTT_BIN} ${exec_args}
+ExecStartPost=${WDTT_EXEC_START_POST}
+ExecStopPost=${WDTT_EXEC_STOP_POST}
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  install_mtu_rules_script
+  if [[ "${WITH_XRAY}" == "1" ]]; then
+    install_xray_rules_script
+  fi
+  disable_legacy_panel_service
+  systemctl daemon-reload
+  systemctl enable wdtt.service
+  info "unit: ExecStart только -config-dir (VPN-параметры в panel.db)"
+}
+
+install_xray_binary() {
+  step "Установка Xray-core..."
+  mkdir -p "$XRAY_BIN_DIR" "$XRAY_LOG_DIR" "$XRAY_CONFIG_DIR"
+  local zip arch_zip url tmpdir zipfile xray_bin
+  case "$ARCH" in
+    amd64) arch_zip="Xray-linux-64.zip" ;;
+    arm64) arch_zip="Xray-linux-arm64-v8a.zip" ;;
+    armv7) arch_zip="Xray-linux-arm32-v7a.zip" ;;
+  esac
+  local tag json
+  json="$(github_curl "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null || true)"
+  tag="$(printf '%s\n' "$json" | json_string_field tag_name | head -1 || true)"
+  [[ -n "$tag" ]] || tag="v26.4.25"
+  url="https://github.com/XTLS/Xray-core/releases/download/${tag}/${arch_zip}"
+  tmpdir="$(mktemp -d /tmp/wdtt-xray.XXXXXX)" || { err "не удалось создать временный каталог"; return 1; }
+  zipfile="${tmpdir}/xray.zip"
+  extract="${tmpdir}/extract"
+  trap 'rm -rf "$tmpdir"' RETURN
+  github_curl "$url" -o "$zipfile" || { err "скачивание Xray ${tag}: HTTP/сеть (часто 403 без UA — обновите install.sh)"; return 1; }
+  mkdir -p "$extract"
+  unzip -oq "$zipfile" -d "$extract" || { err "распаковка ${arch_zip} не удалась (проверьте unzip и место в /tmp)"; return 1; }
+  xray_bin="$(find "$extract" -name xray -type f | head -1)"
+  [[ -n "$xray_bin" ]] || { err "xray binary not found in ${arch_zip}"; return 1; }
+  install -m 0755 "$xray_bin" "${XRAY_BIN_DIR}/$(xray_bin_filename)"
+  github_curl "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -o "${XRAY_BIN_DIR}/geoip.dat" || true
+  github_curl "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -o "${XRAY_BIN_DIR}/geosite.dat" || true
+  info "Xray ${tag} установлен"
+}
+
+install_xray_config() {
+  if [[ -f "${XRAY_CONFIG_DIR}/config.json" ]]; then
+    warn "config.json уже есть — пропускаю"
+  else
+    install -m 0644 "${TEMPLATES_DIR}/xray-config.json" "${XRAY_CONFIG_DIR}/config.json"
+  fi
+  fix_xray_dns_if_needed
+  ensure_xray_tproxy_in
+  mkdir -p "${XRAY_LOG_DIR}"
+  touch "${XRAY_LOG_DIR}/access.log" "${XRAY_LOG_DIR}/error.log"
+  chmod 644 "${XRAY_LOG_DIR}/access.log" "${XRAY_LOG_DIR}/error.log" 2>/dev/null || true
+}
+
+install_xray_rules() {
+  install_mtu_rules_script
+  install_xray_rules_script
+  cat > /etc/systemd/system/wdtt-xray.service <<EOF
+[Unit]
+Description=WDTT Xray routing (wdtt0 -> xray)
+After=wdtt.service network-online.target
+Requires=wdtt.service
+BindsTo=wdtt.service
+
+[Service]
+Type=simple
+Environment=XRAY_LOCATION_ASSET=${XRAY_BIN_DIR}
+ExecStartPre=/usr/bin/env bash -c 'for i in \$(seq 1 30); do ip addr show ${IFACE} 2>/dev/null | grep -q "10.66.66.1" && exit 0; sleep 0.5; done; exit 1'
+ExecStart=${XRAY_BIN_DIR}/$(xray_bin_filename) run -c ${XRAY_CONFIG_DIR}/config.json
+ExecStartPost=/usr/local/bin/wdtt-xray-rules.sh up
+ExecStopPost=-/usr/local/bin/wdtt-xray-rules.sh down
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+WorkingDirectory=${XRAY_LOG_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable wdtt-xray.service
+}
+
+start_services() {
+  step "Запуск сервисов..."
+  disable_legacy_panel_service
+  if ! systemctl restart wdtt.service; then
+    err "wdtt.service не запустился"
+    journalctl -u wdtt -n 20 --no-pager >&2 || true
+    exit 1
+  fi
+  local i
+  for i in $(seq 1 20); do
+    if curl -fsS --max-time 2 http://127.0.0.1:2861/health >/dev/null 2>&1; then
+      break
+    fi
+    if [[ "$i" -eq 20 ]]; then
+      err "wdtt admin /health не ответил после запуска"
+      journalctl -u wdtt -n 30 --no-pager >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+  if [[ "$WITH_XRAY" == "1" ]]; then
+    if ! systemctl restart wdtt-xray.service; then
+      err "wdtt-xray не запустился; UDP TPROXY не подтверждён"
+      journalctl -u wdtt-xray -n 30 --no-pager >&2 || true
+      exit 1
+    fi
+  fi
+}
+
+print_summary() {
+  local ip svc
+  ip="$(curl -4fsS ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ui_clear
+  ui_banner
+  ui_success_box "Установка завершена успешно"
+  echo ""
+  normalize_raw_direct_port
+  normalize_csqtt_peer_port
+  normalize_raw_subnet
+  ui_kv "DTLS порт" "${DTLS_PORT}/udp"
+  ui_kv "WG порт" "${WG_PORT}/udp"
+  ui_kv "RAW порт" "${RAW_DIRECT_PORT}/udp"
+  ui_kv "CSQTT порт" "${CSQTT_PEER_PORT}/udp"
+  ui_kv "RAW subnet" "${RAW_SUBNET}"
+  ui_kv "VPN пароль" "${WDTT_PASSWORD}"
+  if [[ "$WITH_PANEL" == "1" ]]; then
+    echo ""
+    ui_kv "Панель" "http://${ip}:${PANEL_PORT}${PANEL_BASE}"
+    ui_kv "Логин" "admin"
+    ui_kv "Пароль" "wdtt ${dim}(смените в настройках)${plain}"
+  fi
+  if [[ "$WITH_XRAY" == "1" ]]; then
+    echo ""
+    ui_kv "Xray" "настройте outbounds в панели"
+  fi
+  echo ""
+  ui_line
+  echo -e "  ${bold}Сервисы:${plain}"
+  local svc st
+  while IFS= read -r svc; do
+    [[ -n "$svc" ]] || continue
+    st="$(systemctl is-active "${svc}.service" 2>/dev/null || echo inactive)"
+    if [[ "$st" == "active" ]]; then
+      printf "    ${green}●${plain} %-12s ${green}running${plain}\n" "$svc"
+    else
+      printf "    ${dim}○${plain} %-12s ${dim}%s${plain}\n" "$svc" "$st"
+    fi
+  done < <(wdtt_units_list)
+  echo ""
+  ui_line
+  echo -e "  ${dim}Команды:${plain}  ${cyan}wdtt status${plain} · ${cyan}wdtt update${plain} · ${cyan}wdtt restart${plain}"
+  echo ""
+}
+
+print_update_summary() {
+  local ip ver svc
+  ip="$(curl -4fsS ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ver="$(get_installed_version)"
+  ui_clear
+  ui_banner
+  ui_success_box "Обновление завершено"
+  echo ""
+  ui_kv "Версия" "${WDTT_RELEASE_TAG:-$SELECTED_TAG}"
+  ui_kv "Panel" "${ver}"
+  if [[ -n "${WDTT_PASSWORD:-}" ]]; then
+    ui_kv "VPN пароль" "${WDTT_PASSWORD} ${dim}(без изменений)${plain}"
+  fi
+  if [[ "$WITH_PANEL" == "1" ]]; then
+    ui_kv "Панель" "http://${ip}:${PANEL_PORT}${PANEL_BASE}"
+  fi
+  echo ""
+  ui_line
+  echo -e "  ${bold}Сервисы:${plain}"
+  local st
+  while IFS= read -r svc; do
+    [[ -n "$svc" ]] || continue
+    st="$(systemctl is-active "${svc}.service" 2>/dev/null || echo inactive)"
+    if [[ "$st" == "active" ]]; then
+      printf "    ${green}●${plain} %-12s ${green}running${plain}\n" "$svc"
+    else
+      printf "    ${dim}○${plain} %-12s ${dim}%s${plain}\n" "$svc" "$st"
+    fi
+  done < <(wdtt_units_list)
+  echo ""
+  ui_line
+  echo -e "  ${dim}Команды:${plain}  ${cyan}wdtt status${plain} · ${cyan}wdtt update${plain} · ${cyan}wdtt restart${plain}"
+  echo ""
+}
+
+cmd_update() {
+  ui_clear
+  ui_banner
+  ui_box_top
+  ui_box_title "Обновление компонентов"
+  ui_box_bot
+  echo ""
+  WDTT_PASSWORD="$(read_existing_password)"
+  [[ -n "$WDTT_PASSWORD" ]] || WDTT_PASSWORD="$(gen_password)"
+
+  pick_release_version || return 0
+
+  ui_clear
+  ui_banner
+  ui_box_top
+  ui_box_title "Загрузка ${SELECTED_TAG}"
+  ui_box_bot
+  echo ""
+
+  build_wdtt "$SELECTED_TAG"
+  disable_legacy_panel_service
+
+  # Update path must open CSQTT/RAW/DTLS/WG the same as fresh install (UFW/DROP hosts).
+  setup_firewall || warn "firewall update skipped"
+
+  install_mtu_rules_script
+  if [[ "$WITH_XRAY" == "1" ]]; then
+    if [[ -f "${TEMPLATES_DIR}/wdtt-xray-rules.sh" ]]; then
+      step "Обновление правил xray..."
+      install_xray_rules_script
+      info "Скрипт правил xray обновлён; правила применятся после проверки конфига при перезапуске"
+    else
+      apply_mtu_rules
+    fi
+    if [[ ! -x "${XRAY_BIN_DIR}/$(xray_bin_filename)" ]]; then
+      install_xray_binary
+    fi
+    install_xray_config
+    install_xray_rules
+  else
+    teardown_xray_routing_leftovers
+    apply_mtu_rules
+  fi
+
+  install_wdtt_service "$WDTT_PASSWORD"
+  ensure_install_tree
+  install_wdtt_cmd
+
+  repair_panel_db_schema
+
+  step "Перезапуск сервисов..."
+  start_services
+  print_update_summary
+}
+
+stop_wdtt_services() {
+  local u
+  for u in wdtt-xray wdtt; do
+    systemctl stop "$u.service" 2>/dev/null || true
+    systemctl disable "$u.service" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${u}.service"
+  done
+  disable_legacy_panel_service
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed wdtt.service wdtt-xray.service 2>/dev/null || true
+}
+
+kill_wdtt_processes() {
+  pkill -x wdtt-app 2>/dev/null || true
+  pkill -x wdtt-server 2>/dev/null || true
+  pkill -x wdtt-panel 2>/dev/null || true
+  sleep 1
+  pkill -9 -x wdtt-app 2>/dev/null || true
+  pkill -9 -x wdtt-server 2>/dev/null || true
+  pkill -9 -x wdtt-panel 2>/dev/null || true
+}
+
+remove_wdtt_network() {
+  ip link del "$IFACE" 2>/dev/null || true
+  ip link del "$RAW_IFACE" 2>/dev/null || true
+  if [[ -x /usr/local/bin/wdtt-mtu-rules.sh ]]; then
+    WDTT_RAW_NET="${RAW_SUBNET:-10.70.0.0/16}" /usr/local/bin/wdtt-mtu-rules.sh down 2>/dev/null || true
+  fi
+  if [[ -x /usr/local/bin/wdtt-xray-rules.sh ]]; then
+    /usr/local/bin/wdtt-xray-rules.sh down 2>/dev/null || true
+  fi
+}
+
+remove_wdtt_binaries() {
+  rm -f \
+    "$WDTT_CMD" \
+    "$WDTT_BIN" \
+    /usr/local/bin/wdtt-cli \
+    /usr/local/bin/wdtt-server \
+    /usr/local/bin/wdtt-panel \
+    /usr/local/bin/wdtt-xray-rules.sh \
+    /usr/local/bin/wdtt-mtu-rules.sh
+}
+
+cleanup_firewall_comment_rules() {
+  local comment="$1"
+  local table="$2" chain="$3"
+  local rule
+  [[ -n "$comment" ]] || return 0
+  if [[ -n "$table" ]]; then
+    while IFS= read -r rule; do
+      [[ "$rule" == *"--comment ${comment}"* ]] || continue
+      read -r -a args <<<"$rule"
+      [[ "${args[0]:-}" == "-A" ]] || continue
+      args[0]="-D"
+      iptables -t "$table" "${args[@]}" 2>/dev/null || true
+    done < <(iptables -t "$table" -S "$chain" 2>/dev/null)
+  else
+    while IFS= read -r rule; do
+      [[ "$rule" == *"--comment ${comment}"* ]] || continue
+      read -r -a args <<<"$rule"
+      [[ "${args[0]:-}" == "-A" ]] || continue
+      args[0]="-D"
+      iptables "${args[@]}" 2>/dev/null || true
+    done < <(iptables -S "$chain" 2>/dev/null)
+  fi
+}
+
+cleanup_firewall_wdtt() {
+  command -v iptables >/dev/null || return 0
+  step "Удаление правил firewall и NAT..."
+  read_panel_ports_from_db
+  normalize_raw_direct_port
+  normalize_csqtt_peer_port
+  normalize_raw_subnet
+  local wan port_specs=(
+    "${DTLS_PORT}:udp"
+    "${WG_PORT}:udp"
+    "${RAW_DIRECT_PORT}:udp"
+    "${CSQTT_PEER_PORT}:udp"
+    "46000:udp"
+    "${SSH_PORT}:tcp"
+    "${PANEL_PORT}:tcp"
+    "${SUB_PORT}:tcp"
+    "2860:tcp"
+    "2096:tcp"
+    "22:tcp"
+  )
+  wan="$(detect_wan)"
+  local i spec proto port nat_iface
+  for i in $(seq 1 10); do
+    for spec in "${port_specs[@]}"; do
+      proto="${spec#*:}"
+      port="${spec%%:*}"
+      iptables -D INPUT -p "$proto" --dport "$port" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+      iptables -D INPUT -i "$IFACE" -p "$proto" --dport "$port" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+    done
+    iptables -D FORWARD -i "$IFACE" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "$IFACE" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$RAW_IFACE" -m comment --comment "$RAW_IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "$RAW_IFACE" -m comment --comment "$RAW_IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -i "$RAW_IFACE" -m comment --comment "$RAW_IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+    if [[ -n "$wan" ]]; then
+      iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o "$wan" -m comment --comment "$IPT_COMMENT" -j MASQUERADE 2>/dev/null || true
+      iptables -t nat -D POSTROUTING -s "${RAW_SUBNET}" -o "$wan" -m comment --comment "$RAW_IPT_COMMENT" -j MASQUERADE 2>/dev/null || true
+      iptables -t nat -D POSTROUTING -s 10.70.0.0/16 -o "$wan" -m comment --comment "$RAW_IPT_COMMENT" -j MASQUERADE 2>/dev/null || true
+      iptables -t nat -D POSTROUTING -s 10.70.66.0/24 -o "$wan" -m comment --comment "$RAW_IPT_COMMENT" -j MASQUERADE 2>/dev/null || true
+    fi
+    for nat_iface in "$wan" $(ls /sys/class/net 2>/dev/null); do
+      [[ -n "$nat_iface" ]] || continue
+      iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o "$nat_iface" -m comment --comment "$IPT_COMMENT" -j MASQUERADE 2>/dev/null || true
+      iptables -t nat -D POSTROUTING -s "${RAW_SUBNET}" -o "$nat_iface" -m comment --comment "$RAW_IPT_COMMENT" -j MASQUERADE 2>/dev/null || true
+      iptables -t nat -D POSTROUTING -s 10.70.0.0/16 -o "$nat_iface" -m comment --comment "$RAW_IPT_COMMENT" -j MASQUERADE 2>/dev/null || true
+      iptables -t nat -D POSTROUTING -s 10.70.66.0/24 -o "$nat_iface" -m comment --comment "$RAW_IPT_COMMENT" -j MASQUERADE 2>/dev/null || true
+    done
+  done
+  cleanup_firewall_comment_rules "$RAW_IPT_COMMENT" "" "INPUT"
+  cleanup_firewall_comment_rules "$RAW_IPT_COMMENT" "" "FORWARD"
+  cleanup_firewall_comment_rules "$RAW_IPT_COMMENT" "nat" "POSTROUTING"
+  if command -v nft >/dev/null; then
+    nft delete table ip wdtt 2>/dev/null || true
+    nft delete table inet wdtt 2>/dev/null || true
+  fi
+  info "Правила iptables/nft с меткой ${IPT_COMMENT}/${RAW_IPT_COMMENT} сняты"
+}
+
+cmd_uninstall() {
+  ui_clear
+  ui_banner
+  step "Удаление WDTT (конфиги сохраняются)..."
+  stop_wdtt_services
+  kill_wdtt_processes
+  remove_wdtt_network
+  remove_wdtt_binaries
+  rm -rf /usr/local/wdtt-xray "$INSTALL_DIR"
+  info "WDTT удалён. Конфиги сохранены: ${CONFIG_DIR}, ${XRAY_CONFIG_DIR}"
+}
+
+cmd_purge() {
+  ui_clear
+  ui_banner
+  step "Полное удаление WDTT с сервера..."
+  stop_wdtt_services
+  kill_wdtt_processes
+  remove_wdtt_network
+  cleanup_firewall_wdtt
+  remove_wdtt_binaries
+  rm -rf \
+    "$CONFIG_DIR" \
+    "$XRAY_CONFIG_DIR" \
+    "$XRAY_LOG_DIR" \
+    "$XRAY_BIN_DIR" \
+    /usr/local/wdtt-xray \
+    "$INSTALL_DIR" \
+    "$BUILD_DIR"
+  rm -f /etc/sysctl.d/99-wdtt.conf
+  sysctl --system >/dev/null 2>&1 || true
+  info "WDTT полностью удалён (бинарники, сервисы, ${CONFIG_DIR}, ${XRAY_CONFIG_DIR}, firewall)"
+}
+
+cmd_status_pretty() {
+  local u st
+  ui_box_top
+  ui_box_title "Статус сервисов"
+  ui_box_bot
+  echo ""
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    st="$(systemctl is-active "${u}.service" 2>/dev/null || echo "не установлен")"
+    if [[ "$st" == "active" ]]; then
+      printf "    ${green}●${plain} %-14s ${green}%s${plain}\n" "$u" "$st"
+    elif [[ "$st" == "не установлен" ]]; then
+      printf "    ${dim}○${plain} %-14s ${dim}%s${plain}\n" "$u" "$st"
+    else
+      printf "    ${yellow}●${plain} %-14s ${yellow}%s${plain}\n" "$u" "$st"
+    fi
+  done < <(wdtt_units_list)
+  echo ""
+  if is_wdtt_installed; then
+    ui_kv "Версия" "$(get_installed_version)"
+  fi
+  echo ""
+}
+
+cmd_status() {
+  ui_clear
+  ui_banner
+  cmd_status_pretty
+}
+
+# Sourced by tests — expose helpers without running installer main.
+if [[ "${WDTT_INSTALL_LIBONLY:-}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+# ── parse args ──
+ORIG_ARGC=$#
+WITH_PANEL=""
+WITH_XRAY=""
+WDTT_PASSWORD=""
+CMD="install"
+FORCE_INSTALL=0
+NO_MENU=0
+XRAY_MODE_SET=0
+PANEL_MODE_SET=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    install) CMD=install ;;
+    update) CMD=update ;;
+    menu) CMD=menu ;;
+    uninstall|remove) CMD=uninstall ;;
+    purge|remove-all|wipe) CMD=purge ;;
+    status) CMD=status ;;
+    -p|--password) WDTT_PASSWORD="$2"; shift ;;
+    --panel) WITH_PANEL=1; PANEL_MODE_SET=1 ;;
+    --xray) WITH_XRAY=1; XRAY_MODE_SET=1 ;;
+    --direct) WITH_XRAY=0; XRAY_MODE_SET=1 ;;
+    --no-panel) WITH_PANEL=0; PANEL_MODE_SET=1 ;;
+    --force) FORCE_INSTALL=1 ;;
+    --no-menu) NO_MENU=1 ;;
+    --version) WDTT_VERSION="$2"; shift ;;
+    --port) PANEL_PORT="$2"; shift ;;
+    --github-user) GITHUB_USER="$2"; REPO_WDTT="https://github.com/${GITHUB_USER}/wdtt.git"; shift ;;
+    -h|--help)
+      cat <<EOF
+WDTT Installer v${INSTALLER_VERSION}
+
+Установка (SHA обходит CDN-кэш GitHub):
+  SHA=\$(curl -fsSL -A wdtt-install https://api.github.com/repos/${GITHUB_USER}/wdtt-install/commits/main | grep -oE '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' | head -1 | cut -d'"' -f4)
+  bash <(curl -fsSL -A wdtt-install "https://raw.githubusercontent.com/${GITHUB_USER}/wdtt-install/\${SHA}/install.sh")
+
+При ошибке списка версий: export GITHUB_TOKEN=... или WDTT_VERSION=v${INSTALLER_VERSION} wdtt update
+
+Меню: wdtt menu  (всегда свежий скрипт с GitHub)
+
+По умолчанию: пароль генерируется автоматически, xray + panel включаются сами.
+Если WDTT уже установлен — запускается обновление с выбором версии.
+
+Опции:
+  -p, --password PASS   Свой пароль VPN
+  --version TAG         Версия для обновления (v1.5.0)
+  --no-menu             Без интерактивного меню
+  --force               Переустановка
+  menu | update | status | uninstall | purge
+
+  uninstall  — сервисы и бинарники; /etc/wdtt сохраняется
+  purge      — полное удаление: конфиги, NAT, firewall, логи
+
+Переменные: WDTT_GITHUB_USER, WDTT_VERSION, WDTT_RAW_PORT, WDTT_CSQTT_PORT, WDTT_RAW_NET, WDTT_NO_MENU=1
+EOF
+      exit 0
+      ;;
+  esac
+  shift
+done
+
+[[ "$NO_MENU" == "1" || "${WDTT_NO_MENU:-0}" == "1" ]] && NO_MENU=1
+
+# Интерактивное меню: без аргументов + терминал, или явно "menu"
+if [[ "$CMD" == "menu" ]] || { [[ "$ORIG_ARGC" -eq 0 ]] && ui_can_interactive && [[ "$CMD" != "uninstall" && "$CMD" != "purge" && "$CMD" != "status" ]]; }; then
+  run_interactive_menu
+fi
+
+# xray / panel по умолчанию (после меню и флагов CLI)
+if [[ "$CMD" == "install" || "$CMD" == "update" ]]; then
+  if [[ "$XRAY_MODE_SET" != "1" && "${WDTT_DIRECT:-0}" != "1" ]]; then
+    WITH_XRAY=1
+  elif [[ -z "$WITH_XRAY" ]]; then
+    WITH_XRAY=1
+  fi
+  [[ "$XRAY_MODE_SET" != "1" && "${WDTT_DIRECT:-0}" == "1" ]] && WITH_XRAY=0
+  if [[ "$PANEL_MODE_SET" != "1" && "${WDTT_NO_PANEL:-0}" != "1" ]]; then
+    WITH_PANEL=1
+  elif [[ -z "$WITH_PANEL" ]]; then
+    WITH_PANEL=1
+  fi
+  [[ "$PANEL_MODE_SET" != "1" && "${WDTT_NO_PANEL:-0}" == "1" ]] && WITH_PANEL=0
+fi
+[[ -z "$WITH_XRAY" ]] && WITH_XRAY=0
+[[ -z "$WITH_PANEL" ]] && WITH_PANEL=0
+
+case "$CMD" in
+  status) cmd_status; exit 0 ;;
+  uninstall) cmd_uninstall; exit 0 ;;
+  purge) cmd_purge; exit 0 ;;
+esac
+
+# Уже установлен → обновление (если не --force)
+if [[ "$CMD" == "install" && "$FORCE_INSTALL" != "1" ]] && is_wdtt_installed; then
+  CMD=update
+fi
+
+case "$CMD" in
+  update)
+    detect_os
+    install_deps
+    ensure_install_tree
+    cmd_update
+    exit 0
+    ;;
+esac
+
+# ── Свежая установка ──
+ui_clear
+ui_banner
+ui_box_top
+ui_box_title "Установка WDTT"
+ui_box_row "Компоненты" "server + panel + xray"
+ui_box_row "Пароль VPN" "генерируется автоматически"
+ui_box_bot
+echo ""
+ui_line
+echo ""
+
+if [[ -z "$WDTT_PASSWORD" ]]; then
+  if [[ -f "${CONFIG_DIR}/panel.db" ]] || [[ -f "${CONFIG_DIR}/install-main-password.env" ]]; then
+    WDTT_PASSWORD="$(read_existing_password)"
+    [[ -n "$WDTT_PASSWORD" ]] && info "VPN пароль из panel.db ${dim}(без изменений)${plain}"
+  fi
+  if [[ -z "$WDTT_PASSWORD" ]]; then
+    WDTT_PASSWORD="$(gen_password)"
+    info "Сгенерирован пароль VPN: ${bold}${WDTT_PASSWORD}${plain}  ${dim}(сохраните!)${plain}"
+    echo ""
+  fi
+fi
+
+detect_os
+install_deps
+ensure_install_tree
+setup_sysctl
+setup_firewall
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
+seed_install_main_password_env
+# Свежая установка — всегда latest (или WDTT_VERSION), не пин INSTALLER_VERSION.
+# Иначе при отставании install.sh (как 1.4.50) качали несуществующий release / старый src.
+build_wdtt "${WDTT_VERSION:-latest}"
+install_wdtt_service "$WDTT_PASSWORD"
+
+if [[ "$WITH_XRAY" == "1" ]]; then
+  install_xray_binary
+  install_xray_config
+  install_xray_rules
+else
+  teardown_xray_routing_leftovers
+fi
+
+if [[ "$WITH_PANEL" != "1" ]]; then
+  warn "Без панели конфиги не создаются — рекомендуется panel"
+fi
+
+ensure_install_tree
+chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/templates/wdtt.sh" 2>/dev/null || true
+install -m 0755 "$INSTALL_DIR/templates/wdtt.sh" /usr/local/bin/wdtt
+
+repair_panel_db_schema
+
+step "Запуск сервисов..."
+start_services
+print_summary
